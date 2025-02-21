@@ -1,0 +1,604 @@
+%run ../../../Common/RT_CommonFunctions
+
+
+
+config_global = load_config('global_config.yml')
+config = load_config('pos_local_config.yml')
+
+
+from pyspark.sql.window import Window
+from pyspark.sql.types import StringType,LongType, IntegerType
+from pyspark.sql import functions as F
+from pyspark.sql import functions
+from pyspark.sql.functions import *
+from delta.tables import DeltaTable
+from pyspark.sql.functions import row_number, col, sum, count,lit,regexp_extract,when, trim,coalesce
+import hashlib
+
+
+bronze_catalog_name=config_global[config_global_key]["unity_catalog_name"]["bronze"]
+bronze_db_name=config_global[config_global_key]["schema_name"]["bronze"]["fact_pos"]
+bronze_table_name=config["data_sources"]["gk"]["fact"]["src_tables"]["src_retail_transaction_table"]
+silver_catalog_name=config_global[config_global_key]["unity_catalog_name"]["silver"]
+silver_db_name=config_global[config_global_key]["schema_name"]["silver"]["fact_pos"]
+silver_table_name=config["data_sources"]["gk"]["fact"]["sales"]["fact_sales_txn_details_gk"]["silver"]["silver_txn_table_daily"]
+dim_db_name=config_global[config_global_key]["schema_name"]["silver"]["dim_pos"]
+store_table_name=config["data_sources"]["pos"]["dimension"]["dim_store"]["silver"]["silver_dim_store"]
+item_upcs_table_name=config["data_sources"]["gk"]["dimension"]["dim_item_upcs_gk"]["silver"]
+items_table_name=config["data_sources"]["gk"]["dimension"]["dim_items_gk"]["silver"]
+pkg_qty_table=config["data_sources"]["gk"]["dimension"]["dim_package_qty_gk"]["silver"]
+fuel_map_table_name=config["data_sources"]["gk"]["dimension"]["dim_fuel_map_gk"]["silver"]
+marketing_reedamble=config_global[config_global_key]["unity_catalog_name"]["marketing"]+"."+config_global[config_global_key]["schema_name"]["sources"]["punch_db"]+"."+config["data_sources"]["pos"]["dimension"]["dim_reedamble"]["silver"]["silver_dim_redeem"]
+gk_item_sales_stg_table='fact_sales_txn_details_gk_item_sales_stg'
+created_by = config_global[config_global_key]['audit_columns']['created_by']
+updated_by = config_global[config_global_key]['audit_columns']['updated_by']
+
+
+
+
+fullLoadFlag = False
+try:
+    item_sale_max_existing_date = spark.sql(f"select max(ingest_time_stamp) maxDate from {silver_catalog_name}.{silver_db_name}.{silver_table_name} where data_src_key = 11 and upper(txn_type)='SALE' and prd_type in ('Item','Coupon')").first()["maxDate"]
+    if item_sale_max_existing_date:
+        print("Data available")
+        item_sale_src_filter = f" and IngestTimeStamp > '{item_sale_max_existing_date}'"
+        print(f"Loading Data after {item_sale_max_existing_date}")
+
+    else:
+        print("No Data, Full Load")
+        item_sale_src_filter = ""
+        fullLoadFlag = True
+except:
+    print ("Target table not available")
+    item_sale_src_filter = ""
+
+
+
+GKSaleItemDF=spark.sql(f'''with cte1 as (select distinct 
+--  cast(convert_gk_txn_key_to_bigint(`SES:InternalTransactionID`) as DECIMAL(38,0)) as txn_key,
+`SES:InternalTransactionID` as txn_key,
+`SES:InternalTransactionID` as txn_id,
+max(COALESCE(case when ses.`SES:Key` like '%PREPAY_PREAUTH_TRANSACTION_ID%' and 
+COALESCE(retail.Sale.ItemID._Name,retail.Return.ItemID._Name) LIKE '%Prepay Fuel%' then ses.`SES:Value` else null end,retail.return.TransactionLink.`SES:InternalTransactionID`)) as og_txn_id,
+cast(`RetailStoreID` as int) as store_num,
+store.store_banner as store_banner,
+store.store_key as store_key,
+-- cast(null as int) as item_key,
+cast(substring(BusinessDayDate,1,10) as date) as business_date,
+cast(retail.SequenceNumber as int) as detail_line_num,
+cast(retail.return.TransactionLink.LineItemSequenceNumber as int) as og_detail_line_num,
+'SALE' as txn_type,
+ CASE
+    WHEN COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy) = 50 AND COALESCE(retail.Sale.ItemID._Name,retail.return.ItemID._Name) LIKE '%Prepay Fuel%' THEN 'FuelPrepay'
+    WHEN COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy) = 50 THEN 'Fuel'
+    WHEN COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy) = 46 THEN 'Coupon'
+    ELSE 'Item' end as prd_type,
+COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy)::int as merch_hierarchy,
+COALESCE(
+    CAST(
+        CASE
+            WHEN COALESCE(retail.sale._ItemType, retail.return._ItemType) = 'Deposit' THEN
+                COALESCE(retail.sale.RegularSalesUnitPrice._VALUE, retail.return.RegularSalesUnitPrice._VALUE) * -1
+            WHEN COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy) = 46 THEN COALESCE(retail.sale.RegularSalesUnitPrice._VALUE, retail.return.RegularSalesUnitPrice._VALUE) * -1
+            ELSE
+                COALESCE(retail.sale.RegularSalesUnitPrice._VALUE, (retail.return.RegularSalesUnitPrice._VALUE) * -1)
+        END AS decimal(25,4)
+    ), 0
+) AS regular_sell_prc,
+COALESCE(
+    CAST(
+        CASE
+            WHEN COALESCE(retail.sale._ItemType, retail.return._ItemType) = 'Deposit' THEN
+                COALESCE(retail.sale.ExtendedAmount, retail.return.ExtendedAmount) * -1
+             WHEN COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy) = 46
+             THEN COALESCE(retail.sale.ExtendedAmount, retail.return.ExtendedAmount) * -1
+             WHEN retail.Return.`SES:ReasonCode`._Description[0] LIKE '%Lottery%' 
+             THEN 0
+            ELSE
+                COALESCE(retail.sale.ExtendedAmount, (retail.return.ExtendedAmount) * -1)
+        END AS decimal(25,4)
+    ), 0
+) AS sales_amt,
+COALESCE(
+    CAST(
+        CASE
+            WHEN COALESCE(retail.sale._ItemType, retail.return._ItemType) = 'Deposit' THEN
+                COALESCE(retail.sale.ExtendedAmount, retail.return.ExtendedAmount) * -1
+            WHEN COALESCE(retail.sale.MerchandiseHierarchy,retail.return.MerchandiseHierarchy) = 46
+             THEN COALESCE(retail.sale.ExtendedAmount, retail.return.ExtendedAmount) * -1
+            ELSE
+                COALESCE(retail.sale.ExtendedAmount, (retail.return.ExtendedAmount) * -1)
+        END AS decimal(25,4)
+    ), 0
+) AS adj_sales_amt,
+cast(case when retail.Return.`SES:ReasonCode`._Description[0] like '%Lottery%'
+then COALESCE(retail.sale.ExtendedAmount, retail.return.ExtendedAmount)*-1 else 0 end as decimal(25,4)) lottery_winning,
+COALESCE(COALESCE(retail.sale.Quantity._VALUE,retail.return.Quantity._VALUE)::decimal(25,4),0) as sales_qty,
+COALESCE(retail.sale.Quantity._UnitOfMeasureCode,retail.return.Quantity._UnitOfMeasureCode) as sales_qty_uom,
+COALESCE(retail.sale._ItemType,retail.return._ItemType) as item_type_cd,
+ retail._EntryMethod as entry_method,
+ CASE 
+        WHEN retail.Return.`SES:ReasonCode`._Description[0] LIKE '%Lottery%' THEN COALESCE(retail.sale.Description, retail.return.Description) || ' - ' || retail.Return.`SES:ReasonCode`._Description[0]
+        ELSE COALESCE(retail.sale.Description, retail.return.Description)
+    END AS item_desc,
+ COALESCE(retail.sale.ItemID._VALUE,retail.return.ItemID._VALUE)::bigint as item_upc_cd,
+ COALESCE(retail.sale.ItemID._VALUE,retail.return.ItemID._VALUE) as src_item_upc_cd,
+COALESCE(retail.sale.Quantity._UnitOfMeasureCode,retail.return.Quantity._UnitOfMeasureCode) as poscd_modifier_nm,
+ max(case when rt_ses.`SES:Key` like '%POSCodeModifier%' then rt_ses.`SES:Value` else -1 end)::int as item_scan_mod,
+COALESCE(retail.sale.Tax.TaxGroupID[0],retail.return.Tax.TaxGroupID[0])::int as tax_itemizer_mask,
+cast(substring(BeginDateTime,1,10) as date) as begin_date,
+cast(replace(cast(substring(BeginDateTime,1,10) as date),'-','') as INT) as begin_date_key,
+TO_TIMESTAMP(
+    DATE_FORMAT(TO_TIMESTAMP(SUBSTRING(BeginDateTime, 1, 23)), "yyyy-MM-dd'T'HH:mm:ss.SSS")
+  ) AS begin_time,
+cast(substring(EndDateTime,1,10) as date) as end_date,
+cast(replace(cast(substring(EndDateTime,1,10) as date),'-','') as INT) as end_date_key,
+TO_TIMESTAMP(
+    DATE_FORMAT(TO_TIMESTAMP(SUBSTRING(EndDateTime, 1, 23)), "yyyy-MM-dd'T'HH:mm:ss.SSS")
+  ) AS end_time,
+case when `SES:KeyedOfflineCode` ='OffLine' then 'yes' else 'no' end as offline_flag,
+case when operatorID.`_OperatorName` like '%Fuel%' then 'yes' else 'no' end as outside_sales_flag,
+case when RetailTransaction.`_TransactionStatus` ='Suspended' then 'yes' else 'no' end as suspend_flag,
+case when _TrainingModeFlag=True then 'yes' else 'no' end as training_mode_flag,
+CAST(null as bigint)  as grade_id,
+cast(null as int) as position_id,
+retail.sale.SerialNumber as order_reference_id,
+cast(replace(cast(substring(BusinessDayDate,1,10) as date),'-','') as INT) as business_date_key,
+cast(SequenceNumber as int) as event_seq_id,
+cast(substring(retail.BeginDateTime,1,10) as date) as event_start_date,
+cast(replace(cast(substring(retail.BeginDateTime,1,10) as date),'-','') as INT) as event_start_date_key,
+TO_TIMESTAMP(
+    DATE_FORMAT(TO_TIMESTAMP(SUBSTRING(retail.BeginDateTime, 1, 23)), "yyyy-MM-dd'T'HH:mm:ss.SSS")
+  ) AS event_start_time,
+cast(substring(RetailTransaction.ReceiptDateTime,1,10) as date) as receipt_date,
+cast(replace(cast(substring(RetailTransaction.ReceiptDateTime,1,10) as date),'-','') as INT) as receipt_date_key,
+TO_TIMESTAMP(
+    DATE_FORMAT(TO_TIMESTAMP(SUBSTRING(RetailTransaction.ReceiptDateTime, 1, 23)), "yyyy-MM-dd'T'HH:mm:ss.SSS")
+  ) AS receipt_time,
+cast(WorkstationID as int) as  register_id,
+cast(TillID as int) as till_id,
+`SES:InternalTransactionID` as uuid,
+case when retail._VoidFlag=True then 'cancel' else 'normal' end as status,
+retail.`SES:OperatorBypassApproval`.`SES:ApproverID`._WorkerID as prc_override_approver_id,
+cast(null as int) as hose_id,
+AGGREGATE(
+    array_compact(retail.sale.RetailPriceModifier.amount._VALUE),
+    CAST(0 as DOUBLE),
+    (acc, x) -> acc + IFNULL(CAST(x AS DOUBLE), 0)
+)  AS discnt_amt,
+coalesce(concat_ws(' | ',collect_set(coalesce(retail_sale_modifier.PromotionID,r.redeemable_properties))),concat_ws(' | ',collect_set(coalesce(retail_return_modifier.PromotionID,r.redeemable_properties)))) as discnt_reason,
+cast(IngestTimeStamp as timestamp) as ingest_time_stamp,
+SourceFilename as src_filenm,
+11 as data_src_key,
+current_timestamp() as created_date,
+current_timestamp() as updated_date,
+"{created_by}" as created_by,
+"{updated_by}" as updated_by,
+'DAILY_LOAD' as input_src,
+CAST(DATE_FORMAT(CAST(SUBSTRING(retail.BeginDateTime, 1, 19) AS TIMESTAMP), 'HHmmss') AS INT) AS event_start_time_key,
+CAST(DATE_FORMAT(CAST(SUBSTRING(RetailTransaction.ReceiptDateTime, 1, 19) AS TIMESTAMP), 'HHmmss') AS INT) AS receipt_time_key,
+CAST(DATE_FORMAT(CAST(SUBSTRING(EndDateTime, 1, 19) AS TIMESTAMP), 'HHmmss') AS INT) AS end_time_key,
+CAST(DATE_FORMAT(CAST(SUBSTRING(BeginDateTime, 1, 19) AS TIMESTAMP), 'HHmmss') AS INT) AS begin_time_key 
+from
+(select * from {bronze_catalog_name}.{bronze_db_name}.{bronze_table_name} gk
+lateral view explode_outer(RetailTransaction.LineItem) as retail
+lateral view explode_outer(retail.sale.RetailPriceModifier) as retail_sale_modifier
+lateral view explode_outer(retail.return.RetailPriceModifier) as retail_return_modifier
+lateral view explode_outer(`SES:ReceiptHeaderAddonList`.`SES:Addon`) as ses
+lateral view explode_outer(retail.`SES:ReceiptPositionAddonList`.`SES:Addon`) as rt_ses
+where `SES:ReceiptReturnedFlag`::boolean =False and 
+_CancelFlag::boolean is not True and
+cast(`RetailStoreID` as int)<>9931 and RetailTransaction.`_TransactionStatus` <>'Suspended' {item_sale_src_filter}) gk
+    LEFT JOIN {silver_catalog_name}.{dim_db_name}.{store_table_name} store 
+    ON gk.RetailStoreID::int = store.store_number::int
+LEFT JOIN 
+    {marketing_reedamble} r 
+ON 
+    r.id = CAST(
+        CASE 
+            WHEN LOWER(COALESCE(CONCAT_WS('|', retail_sale_modifier.`SES:ExternalOfferID`, retail_return_modifier.`SES:ExternalOfferID`))) LIKE '%redeemable%' 
+                 AND `SES:LoyaltyAccount` IS NOT NULL 
+            THEN SPLIT_PART(COALESCE(CONCAT_WS('|', retail_sale_modifier.`SES:ExternalOfferID`, retail_return_modifier.`SES:ExternalOfferID`)), '|', -1)
+            WHEN LOWER(COALESCE(CONCAT_WS('|', retail_sale_modifier.`SES:ExternalOfferID`, retail_return_modifier.`SES:ExternalOfferID`))) LIKE '%reward%' 
+                 AND `SES:LoyaltyAccount` IS NOT NULL 
+            THEN SPLIT_PART(COALESCE(CONCAT_WS('|', retail_sale_modifier.`SES:ExternalOfferID`, retail_return_modifier.`SES:ExternalOfferID`)), '|', -1)
+            ELSE null
+        END AS INT
+    )
+group by all),
+cte2 as(select tgt.*,pkg.quantity_in_package::int as selling_units
+ from cte1 tgt left join {silver_catalog_name}.{dim_db_name}.{pkg_qty_table} pkg
+  on UPPER(TRIM(tgt.sales_qty_uom)) = UPPER(TRIM(pkg.quantity_unit_of_measurement))
+   where (merch_hierarchy<>50 or trim(merch_hierarchy) is NULL) and entry_method is not null 
+   ),
+src_file_uq as (
+  select *, (sales_amt/sales_qty) sub_factor 
+  ,row_number() over(partition by  txn_key,txn_id,og_txn_id, store_num, store_banner,store_key, business_date, detail_line_num,og_detail_line_num, txn_type, prd_type,merch_hierarchy, regular_sell_prc, sales_amt,adj_sales_amt,lottery_winning, sales_qty, sales_qty_uom,selling_units, item_type_cd, entry_method, item_desc, item_upc_cd,src_item_upc_cd, poscd_modifier_nm, item_scan_mod, tax_itemizer_mask, begin_date, begin_date_key, begin_time, end_date, end_date_key, end_time, offline_flag,outside_sales_flag, suspend_flag, training_mode_flag, grade_id,position_id,order_reference_id, business_date_key,event_seq_id, event_start_date, event_start_date_key, event_start_time, receipt_date, receipt_date_key, receipt_time, register_id, till_id,uuid, status, prc_override_approver_id,hose_id, discnt_amt,  data_src_key, created_date, updated_date, created_by, updated_by, input_src, end_time_key, event_start_time_key, receipt_time_key,begin_time_key order by ingest_time_stamp desc) rnum from cte2)
+select * from src_file_uq where rnum =1
+''')
+
+
+
+
+
+
+excluded_cols = ['item_scan_mod', 'og_txn_id']
+cols = [col for col in GKSaleItemDF.columns if col not in excluded_cols]
+
+
+
+AggregatedDF = GKSaleItemDF.groupBy(*cols).agg(max("og_txn_id").alias("og_txn_id"),max("item_scan_mod").alias("item_scan_mod"))
+
+
+
+AggregatedDF = AggregatedDF.select("txn_key", "txn_id", "og_txn_id", "store_num", "store_banner", "store_key", "business_date", "detail_line_num", "og_detail_line_num", "txn_type", "prd_type", F.col("merch_hierarchy").cast('int').alias('merch_hierarchy'), "regular_sell_prc", "sales_amt", "adj_sales_amt", "lottery_winning", "sales_qty", "sales_qty_uom", "selling_units", "item_type_cd", "entry_method", "item_desc", "item_upc_cd","src_item_upc_cd", "poscd_modifier_nm", F.col("item_scan_mod").cast('int').alias('item_scan_mod'), F.col("tax_itemizer_mask").cast('int').alias('tax_itemizer_mask'), "begin_date", "begin_date_key", "begin_time", F.col("end_date").alias('gk_end_date'), "end_date_key", "end_time", "offline_flag","outside_sales_flag", "suspend_flag", "training_mode_flag", "grade_id", "position_id", "order_reference_id", "business_date_key", "event_seq_id", "event_start_date", "event_start_date_key", "event_start_time", "receipt_date", "receipt_date_key", "receipt_time", "register_id", "till_id", "uuid", "status", "prc_override_approver_id", "hose_id", "discnt_amt", "discnt_reason", "ingest_time_stamp", "src_filenm", "data_src_key", "created_date", "updated_date", "created_by", "updated_by", "input_src", "sub_factor","receipt_time_key","event_start_time_key","end_time_key","begin_time_key")
+
+
+
+#TransformedGKItemSaleDF = AggregatedDF.groupBy(*discount_sub).agg(F.sum("sub_factor").alias("sub_factor"),F.first("src_filenm").alias("src_filenm"))
+TransformedGKItemSaleDF = AggregatedDF.withColumn(
+    "actual_sales_prc", 
+    F.coalesce(F.col("sub_factor").cast("decimal(25,4)"), F.lit(0))
+)
+
+
+
+
+ItemsDF = spark.sql(f"SELECT DISTINCT start_date::date, end_date::date, upc_scanmod,item_upc_key,cast(case when length(upc_code)>=8 then substr(upc_code,1,length(upc_code)-1) else upc_code end as bigint)  as newProdUpc FROM {silver_catalog_name}.{dim_db_name}.{item_upcs_table_name} where lower(item_type) <>'fuel' ")
+
+
+
+
+JoinedSalesItemsDF = TransformedGKItemSaleDF.join(
+    ItemsDF,
+    (
+        (
+            TransformedGKItemSaleDF["item_scan_mod"].cast(IntegerType())
+            == ItemsDF["upc_scanmod"].cast(IntegerType())
+        ) &
+        (
+            TransformedGKItemSaleDF["item_upc_cd"].cast(LongType()) == ItemsDF["newProdUpc"].cast(LongType())
+        ) &
+        (
+            TransformedGKItemSaleDF["business_date"].between(ItemsDF["start_date"], ItemsDF["end_date"])
+        )
+    ),
+    how="left"
+)
+
+
+
+
+
+JoinedSalesItemsDF.createOrReplaceTempView("JoinedSalesItemsDF")
+
+
+
+
+JoinedSalesNestedItemsDF=spark.sql(f"""with prod as (
+select distinct item_upc_key ,barcode,upc_code,upc_scanmod,
+upc.upc_code  as newProdUpc,
+start_date ,end_date,item_number from {silver_catalog_name}.{dim_db_name}.{item_upcs_table_name} upc where lower(item_type)<>'Fuel'
+)
+          SELECT distinct
+    txn_key,
+    txn_id,
+    og_txn_id,
+    store_num,
+    store_banner,
+    store_key,
+    business_date,
+    detail_line_num,
+    og_detail_line_num,
+    txn_type,
+    prd_type,
+    merch_hierarchy,
+    regular_sell_prc,
+    sales_amt,
+    adj_sales_amt,
+    lottery_winning,
+    sales_qty,
+    sales_qty_uom,
+    selling_units,
+    item_type_cd,
+    entry_method,
+    item_desc,
+    item_upc_cd,
+    src_item_upc_cd,
+    poscd_modifier_nm,
+    item_scan_mod,
+    tax_itemizer_mask,
+    begin_date,
+    begin_date_key,
+    begin_time,
+    gk_end_date,
+    end_date_key,
+    end_time,
+    offline_flag,
+    outside_sales_flag,
+    suspend_flag,
+    training_mode_flag,
+    grade_id,
+    position_id,
+    order_reference_id,
+    business_date_key,
+    event_seq_id,
+    event_start_date,
+    event_start_date_key,
+    event_start_time,
+    receipt_date,
+    receipt_date_key,
+    receipt_time,
+    register_id,
+    till_id,
+    uuid,
+    status,
+    prc_override_approver_id,
+    hose_id,
+    discnt_amt,
+    discnt_reason,
+    ingest_time_stamp,
+    data_src_key,
+    created_date,
+    updated_date,
+    created_by,
+    updated_by,
+    input_src,
+    sub_factor,
+    src_filenm,
+    receipt_time_key,
+    event_start_time_key,
+    end_time_key,
+    begin_time_key,
+    actual_sales_prc,
+    coalesce (JoinedSalesItemsDF.item_upc_key,prod.item_upc_key) AS item_upc_key
+from JoinedSalesItemsDF 
+left join prod on
+    prod.newProdUpc = item_upc_cd
+    and prod.upc_scanmod = item_scan_mod
+    and business_date between prod.start_date and prod.end_date
+    and JoinedSalesItemsDF.item_upc_key is null
+""")
+
+
+
+
+
+item_excluded_col = ['item_upc_key']
+cols = [col for col in JoinedSalesNestedItemsDF.columns if col not in item_excluded_col]
+
+
+
+ItemAggregatedDF = JoinedSalesNestedItemsDF.groupBy(*cols).agg(max("item_upc_key").alias("item_upc_key"))
+
+
+ItemAggregatedDF.createOrReplaceTempView('ItemAggregatedDF')
+
+
+
+
+
+ItemsUpcSaleDF=spark.sql(
+f"""
+with item as(
+select item_key,item_upc_key,upc.start_date ,upc.end_date  from 
+{silver_catalog_name}.{dim_db_name}.{items_table_name} item left join {silver_catalog_name}.{dim_db_name}.{item_upcs_table_name} upc
+ on 
+ item.item_number = upc.item_number
+)
+select rt.*,max(item_key) as item_key, max(rt.item_upc_key) as max_item_upc_key
+from ItemAggregatedDF rt 
+left join item on 
+rt.item_upc_key = item.item_upc_key
+  and business_date between item.start_date and item.end_date
+group by all
+""")
+
+
+
+ItemsUpcSaleDF = ItemsUpcSaleDF.withColumn("discnt_amt", col("discnt_amt") * -1)
+
+
+
+GKItemSaleFinalDF = ItemsUpcSaleDF.select(
+    'txn_key', col('txn_id').cast("string").alias("txn_id"), 'og_txn_id', 'store_num', 'store_banner','store_key',
+    'business_date', 'detail_line_num',"og_detail_line_num",coalesce(col('item_key'),F.lit(-1)).cast("bigint").alias("item_key"), coalesce(col('max_item_upc_key'),F.lit(-1)).cast("bigint").alias("item_upc_key"),'txn_type', 'prd_type',col("merch_hierarchy").cast('int').alias('merch_hierarchy'),'actual_sales_prc', col('regular_sell_prc').cast("decimal(25,4)").alias("regular_sell_prc"),
+    col('sales_amt').cast("decimal(25,4)").alias("sales_amt"),"adj_sales_amt",'lottery_winning', 'sales_qty', 'sales_qty_uom','selling_units', 'item_type_cd', 'entry_method',
+    'item_desc', 'item_upc_cd','src_item_upc_cd', 'poscd_modifier_nm', col("item_scan_mod").cast('int').alias('item_scan_mod'), col("tax_itemizer_mask").cast('int').alias('tax_itemizer_mask') ,
+    'begin_date', 'begin_date_key', 'begin_time', 
+    col('gk_end_date').alias('end_date'), 'end_date_key', 
+    'end_time', 'offline_flag','outside_sales_flag', 'suspend_flag', 'training_mode_flag', 'grade_id','position_id','order_reference_id',
+    'business_date_key', 
+    'event_seq_id',
+    'event_start_date', 'event_start_date_key', 'event_start_time', 'receipt_date',
+    'receipt_date_key', 'receipt_time', 'register_id', 'till_id', 'uuid',
+    'status', 'prc_override_approver_id','hose_id',coalesce(col('discnt_amt'), F.lit(0)).cast("decimal(25,4)").alias("discnt_amt"), 'discnt_reason', 'ingest_time_stamp','src_filenm', 'data_src_key',
+    'created_date', 'updated_date', 'created_by', 'updated_by', 'input_src','event_start_time_key','end_time_key','receipt_time_key','begin_time_key'
+).distinct()
+
+
+
+
+GKItemSaleFinalDF.write \
+    .mode("overwrite") \
+    .option("mergeSchema", "true") \
+    .format("delta") \
+    .saveAsTable(f'{bronze_catalog_name}.{bronze_db_name}.{gk_item_sales_stg_table}')
+
+
+
+
+staging_table = f'{bronze_catalog_name}.{bronze_db_name}.{gk_item_sales_stg_table}'
+target_table = f'{silver_catalog_name}.{silver_db_name}.{silver_table_name}'
+
+stagingDF = spark.read.format("delta").table(staging_table)
+
+if stagingDF.take(1):
+    print(f"Implementing merge operation for incremental load for: {target_table}")
+
+    targetDeltaTable = DeltaTable.forName(spark, target_table)
+    targetDeltaTable.alias("target").merge(
+        source=stagingDF.alias("source"),
+        condition="""
+            target.business_date = source.business_date AND
+            target.txn_key = source.txn_key AND
+            target.detail_line_num = source.detail_line_num
+        """
+    ).whenMatchedUpdate(set={
+        "txn_key": "source.txn_key",
+        "txn_id": "source.txn_id",
+        "og_txn_id": "source.og_txn_id",
+        "store_num": "source.store_num",
+        "store_banner": "source.store_banner",
+        "store_key": "source.store_key",
+        "business_date": "source.business_date",
+        "detail_line_num": "source.detail_line_num",
+        "og_detail_line_num": "source.og_detail_line_num",
+        "item_Key": "source.item_Key",
+        "item_upc_key": "source.item_upc_key",
+        "txn_type": "source.txn_type",
+        "prd_type": "source.prd_type",
+        "merch_hierarchy": "source.merch_hierarchy",
+        "actual_sales_prc": "source.actual_sales_prc",
+        "regular_sell_prc": "source.regular_sell_prc",
+        "sales_amt": "source.sales_amt",
+        "adj_sales_amt": "source.adj_sales_amt",
+        "lottery_winning": "source.lottery_winning",
+        "sales_qty": "source.sales_qty",
+        "sales_qty_uom": "source.sales_qty_uom",
+        "selling_units": "source.selling_units",
+        "item_type_cd": "source.item_type_cd",
+        "entry_method": "source.entry_method",
+        "item_desc": "source.item_desc",
+        "item_upc_cd": "source.item_upc_cd",
+        "src_item_upc_cd": "source.src_item_upc_cd",
+        "poscd_modifier_nm": "source.poscd_modifier_nm",
+        "item_scan_mod": "source.item_scan_mod",
+        "tax_itemizer_mask": "source.tax_itemizer_mask",
+        "begin_date": "source.begin_date",
+        "begin_date_key": "source.begin_date_key",
+        "begin_time": "source.begin_time",
+        "end_date": "source.end_date",
+        "end_date_key": "source.end_date_key",
+        "end_time": "source.end_time",
+        "offline_flag": "source.offline_flag",
+        "outside_sales_flag": "source.outside_sales_flag",
+        "suspend_flag": "source.suspend_flag",
+        "training_mode_flag": "source.training_mode_flag",
+        "grade_id": "source.grade_id",
+        "position_id": "source.position_id",
+        "order_reference_id": "source.order_reference_id",
+        "business_date_key": "source.business_date_key",
+        "event_seq_id": "source.event_seq_id",
+        "event_start_date": "source.event_start_date",
+        "event_start_date_key": "source.event_start_date_key",
+        "event_start_time": "source.event_start_time",
+        "receipt_date": "source.receipt_date",
+        "receipt_date_key": "source.receipt_date_key",
+        "receipt_time": "source.receipt_time",
+        "register_id": "source.register_id",
+        "till_id": "source.till_id",
+        "uuid": "source.uuid",
+        "status": "source.status",
+        "prc_override_approver_id": "source.prc_override_approver_id",
+        "hose_id": "source.hose_id",
+        "discnt_amt": "source.discnt_amt",
+        "discnt_reason": "source.discnt_reason",
+        "ingest_time_stamp": "source.ingest_time_stamp",
+        "src_filenm": "source.src_filenm",
+        "data_src_key": "source.data_src_key",
+        "created_date": "source.created_date",
+        "updated_date": "source.updated_date",
+        "created_by": "source.created_by",
+        "updated_by": "source.updated_by",
+        "input_src": "source.input_src",
+        "receipt_time_key": "source.receipt_time_key",
+        "event_start_time_key":"source.event_start_time_key",
+        "end_time_key":"source.end_time_key",
+        "begin_time_key":"source.begin_time_key"
+        
+    }).whenNotMatchedInsert(values={
+        "txn_key": "source.txn_key",
+        "txn_id": "source.txn_id",
+        "og_txn_id": "source.og_txn_id",
+        "store_num": "source.store_num",
+        "store_banner": "source.store_banner",
+        "store_key": "source.store_key",
+        "business_date": "source.business_date",
+        "detail_line_num": "source.detail_line_num",
+        "og_detail_line_num": "source.og_detail_line_num",
+        "item_Key": "source.item_Key",
+        "item_upc_key": "source.item_upc_key",
+        "txn_type": "source.txn_type",
+        "prd_type": "source.prd_type",
+        "merch_hierarchy": "source.merch_hierarchy",
+        "actual_sales_prc": "source.actual_sales_prc",
+        "regular_sell_prc": "source.regular_sell_prc",
+        "sales_amt": "source.sales_amt",
+        "adj_sales_amt": "source.adj_sales_amt",
+        "lottery_winning": "source.lottery_winning",
+        "sales_qty": "source.sales_qty",
+        "sales_qty_uom": "source.sales_qty_uom",
+        "selling_units": "source.selling_units",
+        "item_type_cd": "source.item_type_cd",
+        "entry_method": "source.entry_method",
+        "item_desc": "source.item_desc",
+        "item_upc_cd": "source.item_upc_cd",
+        "src_item_upc_cd": "source.src_item_upc_cd",
+        "poscd_modifier_nm": "source.poscd_modifier_nm",
+        "item_scan_mod": "source.item_scan_mod",
+        "tax_itemizer_mask": "source.tax_itemizer_mask",
+        "begin_date": "source.begin_date",
+        "begin_date_key": "source.begin_date_key",
+        "begin_time": "source.begin_time",
+        "end_date": "source.end_date",
+        "end_date_key": "source.end_date_key",
+        "end_time": "source.end_time",
+        "offline_flag": "source.offline_flag",
+        "outside_sales_flag": "source.outside_sales_flag",
+        "suspend_flag": "source.suspend_flag",
+        "training_mode_flag": "source.training_mode_flag",
+        "grade_id": "source.grade_id",
+        "position_id": "source.position_id",
+        "order_reference_id": "source.order_reference_id",
+        "business_date_key": "source.business_date_key",
+        "event_seq_id": "source.event_seq_id",
+        "event_start_date": "source.event_start_date",
+        "event_start_date_key": "source.event_start_date_key",
+        "event_start_time": "source.event_start_time",
+        "receipt_date": "source.receipt_date",
+        "receipt_date_key": "source.receipt_date_key",
+        "receipt_time": "source.receipt_time",
+        "register_id": "source.register_id",
+        "till_id": "source.till_id",
+        "uuid": "source.uuid",
+        "status": "source.status",
+        "prc_override_approver_id": "source.prc_override_approver_id",
+        "hose_id": "source.hose_id",
+        "discnt_amt": "source.discnt_amt",
+        "discnt_reason": "source.discnt_reason",
+        "ingest_time_stamp": "source.ingest_time_stamp",
+        "src_filenm": "source.src_filenm",
+        "data_src_key": "source.data_src_key",
+        "created_date": "source.created_date",
+        "updated_date": "source.updated_date",
+        "created_by": "source.created_by",
+        "updated_by": "source.updated_by",
+        "input_src": "source.input_src",
+        "receipt_time_key": "source.receipt_time_key",
+        "event_start_time_key":"source.event_start_time_key",
+        "end_time_key":"source.end_time_key",
+        "begin_time_key":"source.begin_time_key"
+    }).execute()
+
+    print("Completed merge operation for incremental load")
+else:
+    print("No incremental records found, skipping merge operation")
+
+
+
+
+spark.sql(f"""
+update {silver_catalog_name}.{silver_db_name}.{silver_table_name} set item_key=null where  txn_type='SALE' and prd_type in ('Item','Coupon') and item_key=-1""")
+
+
